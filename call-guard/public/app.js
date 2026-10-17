@@ -1,44 +1,44 @@
-/* Ruko Call Guard: browser app. Captures call audio, sends short chunks to the
- * server for speech-to-text, checks the transcript instantly with ScamRules and
- * periodically with the AI, and raises a full-screen alarm on a scam. */
+/* Ruko Call Guard: browser app. Everything runs on this device:
+ *   audio -> Vosk speech recognition (WebAssembly, offline) -> text
+ *   text  -> FraudRules (rule-based) -> safe / caution / scam + fraud type
+ * No audio or text is sent to any server. */
 (function () {
   'use strict';
 
-  var Rules = window.ScamRules;
+  var Rules = window.FraudRules;
   var DEMO = window.DemoCalls;
 
-  var CHUNK_SECONDS = 5;          // audio per speech-to-text request
-  var TARGET_RATE = 16000;        // Sarvam works best with 16 kHz mono
-  var SILENCE_RMS = 0.006;        // skip chunks quieter than this (saves API calls)
-  var MAX_PENDING_STT = 4;        // drop audio rather than fall far behind the call
-  var AI_MIN_GAP_MS = 4000;       // at most one AI check every 4 s
+  var MODEL_FILES = { hi: 'models/hi.tar.gz', 'en-in': 'models/en-in.tar.gz' };
+  var MODEL_NAMES = { hi: 'Hindi', 'en-in': 'English (India)' };
+  var MODEL_LOAD_TIMEOUT_MS = 180000; // first load downloads ~40 MB; later loads come from browser storage
+  var PARTIAL_CHECK_MS = 300;         // check half-heard words at most this often
   var DEMO_LINE_MS = 2600;
   var ORDER = { idle: -1, safe: 0, caution: 1, scam: 2 };
 
   var $ = function (id) { return document.getElementById(id); };
 
   var S = {
-    status: { stt: false, ai: false, offline: false },
+    models: { hi: false, 'en-in': false },
+    voskLoaded: null,     // Promise for the vosk.js script
+    voskModels: {},       // lang -> Promise<Model>, kept across calls so models load once
     running: false,
     source: 'demo',
     lines: [],
+    partials: {},         // lang -> text being heard right now
     spokenDigits: false,
     level: 'idle',
     score: 0,
-    ruleFlags: [],
-    ai: null,
+    flags: {},            // id -> flag, everything seen during this call
+    fraudType: null,
+    isUpiFraud: false,
     alerted: { caution: false, scam: false },
     startedAt: 0,
     timerId: null,
     demoTimer: null,
+    partialTimer: null,
+    lastPartialCheck: 0,
     audio: null,
-    sttPending: 0,
-    sttQueue: Promise.resolve(),
-    sttWarned: false,
-    aiInFlight: false,
-    aiLast: 0,
-    aiTimer: null,
-    aiDirty: false,
+    recognizers: [],
     wakeLock: null,
     titleTimer: null
   };
@@ -48,28 +48,6 @@
     return String(s).replace(/[&<>"']/g, function (c) {
       return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
     });
-  }
-
-  function highlight(text, phrases) {
-    var lower = text.toLowerCase();
-    var ranges = [];
-    phrases.forEach(function (p) {
-      if (!p || p === '••••') return;
-      var q = p.toLowerCase(), i = 0;
-      while ((i = lower.indexOf(q, i)) !== -1) { ranges.push([i, i + q.length]); i += q.length; }
-    });
-    ranges.sort(function (a, b) { return a[0] - b[0]; });
-    var merged = [];
-    ranges.forEach(function (r) {
-      var last = merged[merged.length - 1];
-      if (last && r[0] <= last[1]) last[1] = Math.max(last[1], r[1]); else merged.push(r.slice());
-    });
-    var out = '', pos = 0;
-    merged.forEach(function (r) {
-      out += esc(text.slice(pos, r[0])) + '<mark>' + esc(text.slice(r[0], r[1])) + '</mark>';
-      pos = r[1];
-    });
-    return out + esc(text.slice(pos));
   }
 
   function clock(ms) {
@@ -82,59 +60,138 @@
     $('error').hidden = !msg;
   }
 
-  function transcriptText() {
-    return S.lines.map(function (l) { return l.text; }).join(' ');
-  }
-
-  // ---------- service status ----------
-  function loadStatus() {
-    return fetch('/api/status', { cache: 'no-store' })
-      .then(function (r) { if (!r.ok) throw new Error(); return r.json(); })
-      .then(function (j) { S.status = { stt: !!j.stt, ai: !!j.ai, sttModel: j.sttModel, aiModel: j.aiModel, offline: false }; })
-      .catch(function () { S.status = { stt: false, ai: false, offline: true }; })
-      .then(renderServices);
-  }
-
-  function renderServices() {
-    var st = S.status;
-    $('svc-stt').dataset.on = String(st.stt);
-    $('svc-stt').textContent = 'Speech-to-text: ' + (st.stt ? 'Sarvam ' + (st.sttModel || '') : 'off');
-    $('svc-ai').dataset.on = String(st.ai);
-    $('svc-ai').textContent = 'AI check: ' + (st.ai ? 'OpenAI ' + (st.aiModel || '') : 'off');
-    ['src-mic', 'src-tab', 'src-file'].forEach(function (id) {
-      var input = $(id);
-      input.disabled = !st.stt;
-      input.parentNode.title = st.stt ? '' : (st.offline ? 'Start the server (npm start) to use live audio.' : 'Add SARVAM_API_KEY to .env to use live audio.');
+  function withTimeout(promise, ms, message) {
+    return new Promise(function (resolve, reject) {
+      var t = setTimeout(function () { reject(new Error(message)); }, ms);
+      promise.then(function (v) { clearTimeout(t); resolve(v); }, function (e) { clearTimeout(t); reject(e); });
     });
   }
 
-  // ---------- risk ----------
-  function levelFromAi(ai) {
-    if (!ai) return 'safe';
-    return ai.verdict === 'scam' ? 'scam' : ai.verdict === 'suspicious' ? 'caution' : 'safe';
+  // Highlight the exact phrases the rules matched. Rule quotes are in
+  // normalized form (e.g. Hindi words mapped to Roman), so each transcript word
+  // is normalized the same way before comparing whole phrases.
+  function highlight(text, quotes) {
+    var parts = text.split(/(\s+)/);
+    var words = [];
+    parts.forEach(function (part, i) {
+      if (/\S/.test(part)) words.push({ i: i, toks: Rules.tokenize(part).filter(function (t) { return t !== '|'; }) });
+    });
+    var marked = {};
+    quotes.forEach(function (q) {
+      var want = String(q || '').split(' ').filter(Boolean);
+      if (!want.length || q === '••••') return;
+      for (var w = 0; w < words.length; w++) {
+        var k = 0, end = w;
+        while (end < words.length && k < want.length) {
+          var toks = words[end].toks;
+          var ok = toks.length > 0;
+          for (var t = 0; t < toks.length && k < want.length; t++, k++) { if (toks[t] !== want[k]) { ok = false; break; } }
+          if (!ok) break;
+          end++;
+        }
+        if (k === want.length) { for (var m = w; m < end; m++) marked[words[m].i] = true; }
+      }
+    });
+    return parts.map(function (part, i) { return marked[i] ? '<mark>' + esc(part) + '</mark>' : esc(part); }).join('');
   }
 
-  function maxLevel(a, b) { return ORDER[a] >= ORDER[b] ? a : b; }
+  // ---------- speech models ----------
+  function detectModels() {
+    return fetch('models/index.json', { cache: 'no-store' })
+      .then(function (r) { return r.ok ? r.json() : []; }, function () { return []; })
+      .then(function (list) {
+        Object.keys(MODEL_FILES).forEach(function (lang) { S.models[lang] = list.indexOf(lang) !== -1; });
+        renderSpeechStatus();
+      });
+  }
 
-  // Risk only goes up during a call: once a scammer has asked for an OTP, later
+  function renderSpeechStatus() {
+    var have = Object.keys(S.models).filter(function (l) { return S.models[l]; });
+    var chip = $('svc-speech');
+    chip.dataset.on = String(have.length > 0);
+    chip.textContent = have.length
+      ? 'Speech: on-device (' + have.map(function (l) { return MODEL_NAMES[l]; }).join(', ') + ')'
+      : 'Speech: no model yet';
+    ['src-mic', 'src-tab', 'src-file'].forEach(function (id) {
+      $(id).disabled = S.running || !have.length;
+    });
+    var sel = $('speech-lang');
+    Array.prototype.forEach.call(sel.options, function (o) {
+      o.disabled = o.value === 'both' ? !(S.models.hi && S.models['en-in']) : !S.models[o.value];
+    });
+    if (sel.selectedOptions[0] && sel.selectedOptions[0].disabled) {
+      var first = Array.prototype.find.call(sel.options, function (o) { return !o.disabled; });
+      if (first) sel.value = first.value;
+    }
+    var note = $('model-note');
+    if (!have.length) {
+      note.hidden = false;
+      note.innerHTML = 'Live listening needs a free offline speech model (one-time, about 40 MB). Run <b>npm run models</b> and reload. Demo calls and typed tests work now.';
+    } else {
+      note.hidden = true;
+    }
+  }
+
+  function loadVoskScript() {
+    if (S.voskLoaded) return S.voskLoaded;
+    S.voskLoaded = new Promise(function (resolve, reject) {
+      var s = document.createElement('script');
+      s.src = 'vendor/vosk.js';
+      s.onload = function () { window.Vosk ? resolve(window.Vosk) : reject(new Error('Speech engine did not load.')); };
+      s.onerror = function () { S.voskLoaded = null; reject(new Error('Speech engine is missing. Run npm install, then restart the server.')); };
+      document.head.appendChild(s);
+    });
+    return S.voskLoaded;
+  }
+
+  function loadModel(lang) {
+    if (S.voskModels[lang]) return S.voskModels[lang];
+    var url = new URL(MODEL_FILES[lang], location.href).href;
+    var p = loadVoskScript().then(function (Vosk) {
+      return withTimeout(Vosk.createModel(url, -1), MODEL_LOAD_TIMEOUT_MS,
+        'The ' + MODEL_NAMES[lang] + ' speech model took too long to load. Reload the page and try again.');
+    });
+    p.catch(function () { delete S.voskModels[lang]; });
+    S.voskModels[lang] = p;
+    return p;
+  }
+
+  function selectedLangs() {
+    var v = $('speech-lang').value;
+    return v === 'both' ? ['hi', 'en-in'] : [v];
+  }
+
+  // ---------- risk ----------
+  // Risk only goes up during a call: once a caller has asked for an OTP, later
   // small talk does not make the call safe again.
   function evaluate() {
-    var r = Rules.analyze(transcriptText(), { spokenDigits: S.spokenDigits });
-    S.ruleFlags = r.flags;
-    var level = maxLevel(r.level, levelFromAi(S.ai));
-    S.level = S.lines.length ? maxLevel(S.level === 'idle' ? 'safe' : S.level, level) : (S.running ? 'safe' : 'idle');
-    S.score = Math.max(S.score, r.score, S.ai ? S.ai.score : 0);
-    if (S.level === 'scam') S.score = Math.max(S.score, Rules.SCAM_AT);
+    var utterances = S.lines.map(function (l) { return l.text; });
+    Object.keys(S.partials).forEach(function (k) { if (S.partials[k]) utterances.push(S.partials[k]); });
+    var r = Rules.analyze(utterances, { spokenDigits: S.spokenDigits });
+
+    r.flags.forEach(function (f) { if (!S.flags[f.id]) S.flags[f.id] = f; });
+    if (r.fraudType && (!S.fraudType || ORDER[r.level] >= ORDER[S.level])) S.fraudType = r.fraudType;
+    S.isUpiFraud = S.isUpiFraud || r.isUpiFraud;
+
+    var base = S.level === 'idle' ? 'safe' : S.level;
+    S.level = ORDER[r.level] > ORDER[base] ? r.level : base;
+    S.score = Math.max(S.score, r.score);
     render();
     maybeAlert();
+  }
+
+  function sortedFlags() {
+    var order = { critical: 0, high: 1, medium: 2 };
+    return Object.keys(S.flags).map(function (k) { return S.flags[k]; })
+      .sort(function (a, b) { return order[a.severity] - order[b.severity]; });
   }
 
   // ---------- rendering ----------
   var COPY = {
     idle: { tag: 'Not listening', title: 'Ready when your call starts', sub: 'Pick how to listen, then press Start.', hi: 'कॉल शुरू होते ही Start दबाएँ।' },
     safe: { tag: 'Listening', title: 'No warning signs yet', sub: 'Keep this page open. You will be warned the moment something sounds wrong.', hi: 'हम सुन रहे हैं। कुछ गलत लगा तो तुरंत बताएँगे।' },
-    caution: { tag: 'Be careful', title: 'Be careful on this call', sub: 'Do not share any OTP, PIN or card details. Say you will call back on the official number.', hi: 'सावधान रहें। OTP, PIN या कार्ड की जानकारी न दें।' },
-    scam: { tag: 'Scam call', title: 'Scam call. Hang up now.', sub: 'Do not share OTP, card number, CVV or PIN. Do not send money.', hi: 'यह धोखाधड़ी कॉल है। फोन काट दें।' }
+    caution: { tag: 'Be careful', title: 'Be careful on this call', sub: 'Do not share any OTP, PIN or card details, and do not scan or approve anything.', hi: 'सावधान रहें। OTP, PIN या कार्ड की जानकारी न दें।' },
+    scam: { tag: 'Fraud call', title: 'Fraud call. Hang up now.', sub: 'Do not share OTP, card number, CVV or PIN. Do not send money or scan anything.', hi: 'यह धोखाधड़ी कॉल है। फोन काट दें।' }
   };
 
   function render() {
@@ -149,60 +206,51 @@
     $('pin').style.left = S.score + '%';
     $('score').textContent = S.score + '/100';
 
-    var allFlags = S.ruleFlags.slice();
-    var quotes = allFlags.map(function (f) { return f.quote; });
-    if (S.ai) S.ai.redFlags.forEach(function (f) { quotes.push(f.quote); });
+    var showVerdict = S.level === 'caution' || S.level === 'scam';
+    $('verdict-row').hidden = !showVerdict;
+    if (showVerdict) {
+      $('type-pill').textContent = S.fraudType ? S.fraudType.label + ' · ' + S.fraudType.labelHi : 'Suspicious call';
+      $('upi-pill').dataset.upi = String(S.isUpiFraud);
+      $('upi-pill').textContent = 'UPI fraud: ' + (S.isUpiFraud ? 'Yes' : 'No');
+    }
 
-    // transcript
+    var flags = sortedFlags();
+    var quotes = flags.map(function (f) { return f.quote; });
+
+    // transcript, plus what is being heard right now
+    var items = S.lines.map(function (l) {
+      return '<li data-who="' + esc(l.who) + '"><span class="who">' + esc(l.who) + '<time>' + l.at + '</time></span><span class="txt">' + highlight(l.text, quotes) + '</span></li>';
+    });
+    Object.keys(S.partials).forEach(function (k) {
+      if (S.partials[k]) items.push('<li class="partial"><span class="who">Hearing</span><span class="txt">' + highlight(S.partials[k], quotes) + '…</span></li>');
+    });
     var tr = $('transcript');
-    if (!S.lines.length) {
-      tr.innerHTML = '<li class="empty">The call\'s words will appear here as they are heard.</li>';
+    tr.innerHTML = items.length ? items.join('') : '<li class="empty">The call\'s words will appear here as they are heard.</li>';
+    tr.scrollTop = tr.scrollHeight;
+
+    // advice for the detected fraud type
+    var adv = $('advice');
+    if (showVerdict && S.fraudType) {
+      adv.hidden = false;
+      adv.innerHTML = '<span class="eyebrow">' + esc(S.fraudType.label) + ': what to do</span><span>' + esc(S.fraudType.adviceEn) + '</span><span class="hi" lang="hi">' + esc(S.fraudType.adviceHi) + '</span>';
     } else {
-      tr.innerHTML = S.lines.map(function (l) {
-        return '<li data-who="' + esc(l.who) + '"><span class="who">' + esc(l.who) + '<time>' + l.at + '</time></span><span class="txt">' + highlight(l.text, quotes) + '</span></li>';
-      }).join('');
-      tr.scrollTop = tr.scrollHeight;
+      adv.hidden = true;
     }
 
-    // AI verdict
-    var box = $('ai-box');
-    if (S.ai) {
-      box.hidden = false;
-      box.innerHTML =
-        '<span class="eyebrow">AI check · ' + esc(S.ai.verdict) + ' · ' + S.ai.score + '/100' + (S.ai.scamType ? ' · ' + esc(S.ai.scamType) : '') + '</span>' +
-        (S.ai.adviceEn ? '<span>' + esc(S.ai.adviceEn) + '</span>' : '') +
-        (S.ai.adviceHi ? '<span class="hi" lang="hi">' + esc(S.ai.adviceHi) + '</span>' : '') +
-        (S.ai.sayThis ? '<span class="say">Say: "' + esc(S.ai.sayThis) + '"</span>' : '');
-    } else if (S.running && !S.status.ai) {
-      box.hidden = false;
-      box.innerHTML = '<span class="eyebrow">AI check off</span><span>Using the instant keyword detector only. Add OPENAI_API_KEY to .env for a smarter second opinion.</span>';
-    } else {
-      box.hidden = true;
-    }
-
-    // flags
-    var items = allFlags.map(function (f) {
+    $('flags').innerHTML = flags.length ? flags.map(function (f) {
       return '<li class="flag" data-sev="' + f.severity + '">' +
         '<div class="flag-head"><h3>' + esc(f.label) + '</h3><span class="pills"><span class="pill" data-sev="' + f.severity + '">' + f.severity + '</span></span></div>' +
         '<span class="hi" lang="hi">' + esc(f.labelHi) + '</span>' +
         (f.quote && f.quote !== '••••' ? '<span class="quote">heard: "' + esc(f.quote) + '"</span>' : '') +
         '<span class="why">' + esc(f.why) + '</span></li>';
-    });
-    if (S.ai) {
-      var sev = S.ai.verdict === 'scam' ? 'critical' : S.ai.verdict === 'suspicious' ? 'high' : 'medium';
-      S.ai.redFlags.forEach(function (f) {
-        items.push('<li class="flag" data-sev="' + sev + '"><div class="flag-head"><h3>' + esc(f.label) + '</h3><span class="pills"><span class="pill src-ai">AI</span></span></div>' +
-          (f.quote ? '<span class="quote">heard: "' + esc(f.quote) + '"</span>' : '') + '</li>');
-      });
-    }
-    $('flags').innerHTML = items.length ? items.join('') : '<li class="empty">No warning signs yet.</li>';
+    }).join('') : '<li class="empty">No warning signs yet.</li>';
   }
 
   // ---------- alerts ----------
+  var beepCtx = null;
   function beep(pattern) {
-    var ctx = S.audio && S.audio.ctx;
     try {
-      if (!ctx || ctx.state === 'closed') { ctx = new (window.AudioContext || window.webkitAudioContext)(); }
+      var ctx = S.audio && S.audio.ctx.state !== 'closed' ? S.audio.ctx : (beepCtx || (beepCtx = new (window.AudioContext || window.webkitAudioContext)()));
       var t = ctx.currentTime;
       pattern.forEach(function (freq, i) {
         var o = ctx.createOscillator(), g = ctx.createGain();
@@ -225,7 +273,6 @@
       u.lang = p.lang;
       var v = voices.find(function (x) { return x.lang && x.lang.toLowerCase().indexOf(p.lang.slice(0, 2)) === 0; });
       if (v) u.voice = v;
-      u.rate = 1;
       window.speechSynthesis.speak(u);
     });
   }
@@ -246,23 +293,19 @@
     var alt = false;
     S.titleTimer = setInterval(function () {
       alt = !alt;
-      document.title = alt ? '⚠ SCAM CALL: HANG UP' : 'Ruko Call Guard';
+      document.title = alt ? '⚠ FRAUD CALL: HANG UP' : 'Ruko Call Guard';
     }, 900);
   }
 
-  function topReasons() {
-    var labels = S.ruleFlags.map(function (f) { return f.label; });
-    if (S.ai) S.ai.redFlags.forEach(function (f) { if (labels.indexOf(f.label) === -1) labels.push(f.label); });
-    return labels.slice(0, 4);
-  }
-
   function maybeAlert() {
+    var type = S.fraudType;
     if (S.level === 'scam' && !S.alerted.scam) {
       S.alerted.scam = true;
-      var reasons = topReasons();
-      $('alarm-type').textContent = (S.ai && S.ai.scamType ? S.ai.scamType : 'Scam call detected');
+      var reasons = sortedFlags().slice(0, 4).map(function (f) { return f.label; });
+      $('alarm-type').textContent = (type ? type.label : 'Fraud call') + (S.isUpiFraud && (!type || type.id !== 'upi_fraud') ? ' · UPI fraud' : '') + ' detected';
       $('alarm-reasons').innerHTML = reasons.map(function (r) { return '<li>' + esc(r) + '</li>'; }).join('');
-      if (S.ai && S.ai.sayThis) $('alarm-say').textContent = '"' + S.ai.sayThis + '"';
+      $('alarm-advice').textContent = type ? type.adviceEn : 'Do not share any OTP, card number, CVV or PIN. Do not send money.';
+      $('alarm-advice-hi').textContent = type ? type.adviceHi : 'OTP, कार्ड नंबर या PIN किसी को न बताएं।';
       $('alarm-warn').hidden = false;
       $('alarm-after').hidden = true;
       $('alarm').hidden = false;
@@ -270,17 +313,17 @@
       beep([880, 660, 880, 660, 880]);
       if (navigator.vibrate) navigator.vibrate([400, 150, 400, 150, 400]);
       speak([
-        { text: 'Warning. This looks like a scam call. Hang up now. Do not share any OTP, card or PIN.', lang: 'en-IN' },
-        { text: 'सावधान। यह धोखाधड़ी कॉल है। फोन काट दें। ओटीपी किसी को न बताएं।', lang: 'hi-IN' }
+        { text: 'Warning. This is a fraud call. Hang up now. ' + (type ? type.adviceEn : ''), lang: 'en-IN' },
+        { text: 'सावधान। यह धोखाधड़ी कॉल है। फोन काट दें।', lang: 'hi-IN' }
       ]);
-      notify('Scam call: hang up now', reasons.join(' · ') || 'The caller is using scam tactics.', true);
+      notify('Fraud call: hang up now', (type ? type.label + ': ' : '') + reasons.join(' · '), true);
       flashTitle(true);
     } else if (S.level === 'caution' && !S.alerted.caution && !S.alerted.scam) {
       S.alerted.caution = true;
       beep([660, 660]);
       if (navigator.vibrate) navigator.vibrate([200, 100, 200]);
-      speak([{ text: 'Be careful. Do not share any OTP or card details on this call.', lang: 'en-IN' }]);
-      notify('Be careful on this call', topReasons().join(' · '), false);
+      speak([{ text: 'Be careful. Do not share any OTP, PIN or card details on this call.', lang: 'en-IN' }]);
+      notify('Be careful on this call', sortedFlags().map(function (f) { return f.label; }).join(' · '), false);
     }
   }
 
@@ -297,73 +340,33 @@
     if (masked.spokenDigits) S.spokenDigits = true;
     S.lines.push({ who: who, text: masked.text.trim(), at: clock(Date.now() - S.startedAt) });
     evaluate();
-    scheduleAi();
   }
 
-  // ---------- AI ----------
-  function scheduleAi() {
-    if (!S.status.ai) return;
-    S.aiDirty = true;
-    if (S.aiInFlight || S.aiTimer) return;
-    var wait = Math.max(0, AI_MIN_GAP_MS - (Date.now() - S.aiLast));
-    S.aiTimer = setTimeout(runAi, wait);
+  // Checking half-heard words gives a warning before the sentence ends. Vosk
+  // repeats the same partial many times a second (often empty during silence),
+  // so only changed text is checked, and at most once per PARTIAL_CHECK_MS.
+  function setPartial(lang, text) {
+    var masked = Rules.maskNumbers(text || '');
+    var clean = masked.text.trim();
+    if (clean === (S.partials[lang] || '')) return;
+    if (masked.spokenDigits) S.spokenDigits = true;
+    S.partials[lang] = clean;
+    var wait = PARTIAL_CHECK_MS - (Date.now() - S.lastPartialCheck);
+    if (wait <= 0) { checkPartials(); return; }
+    if (!S.partialTimer) S.partialTimer = setTimeout(checkPartials, wait);
   }
 
-  function runAi() {
-    S.aiTimer = null;
-    if (!S.aiDirty || !S.lines.length) return;
-    S.aiDirty = false;
-    S.aiInFlight = true;
-    S.aiLast = Date.now();
-    var session = S.startedAt;
-    fetch('/api/analyze', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ transcript: transcriptText() })
-    })
-      .then(function (r) { return r.json().then(function (j) { if (!r.ok) throw new Error(j.error || 'AI check failed.'); return j; }); })
-      .then(function (j) {
-        if (session !== S.startedAt) return; // a newer call has started
-        if (j.ai) {
-          // Keep the highest AI verdict seen during this call.
-          if (!S.ai || j.score >= S.ai.score) S.ai = j;
-          evaluate();
-        }
-      })
-      .catch(function (e) { showError(e.message); })
-      .then(function () {
-        S.aiInFlight = false;
-        if (S.aiDirty) scheduleAi();
-      });
+  function checkPartials() {
+    clearTimeout(S.partialTimer);
+    S.partialTimer = null;
+    S.lastPartialCheck = Date.now();
+    if (S.running) evaluate();
   }
 
   // ---------- audio capture ----------
-  function downsample(data, fromRate) {
-    if (fromRate === TARGET_RATE) return data;
-    var ratio = fromRate / TARGET_RATE;
-    var out = new Float32Array(Math.floor(data.length / ratio));
-    for (var i = 0; i < out.length; i++) {
-      var start = Math.floor(i * ratio), end = Math.min(data.length, Math.floor((i + 1) * ratio));
-      var sum = 0;
-      for (var j = start; j < end; j++) sum += data[j];
-      out[i] = sum / Math.max(1, end - start);
-    }
-    return out;
-  }
-
-  function encodeWav(samples) {
-    var buffer = new ArrayBuffer(44 + samples.length * 2);
-    var v = new DataView(buffer);
-    function str(o, s) { for (var i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); }
-    str(0, 'RIFF'); v.setUint32(4, 36 + samples.length * 2, true); str(8, 'WAVE');
-    str(12, 'fmt '); v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
-    v.setUint32(24, TARGET_RATE, true); v.setUint32(28, TARGET_RATE * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true);
-    str(36, 'data'); v.setUint32(40, samples.length * 2, true);
-    for (var i = 0, o = 44; i < samples.length; i++, o += 2) {
-      var s = Math.max(-1, Math.min(1, samples[i]));
-      v.setInt16(o, s < 0 ? s * 0x8000 : s * 0x7fff, true);
-    }
-    return new Blob([buffer], { type: 'audio/wav' });
+  function makeContext() {
+    var AC = window.AudioContext || window.webkitAudioContext;
+    try { return new AC({ sampleRate: 16000 }); } catch (e) { return new AC(); } // 16 kHz is what the models use
   }
 
   function rms(data) {
@@ -372,87 +375,67 @@
     return Math.sqrt(sum / Math.max(1, data.length));
   }
 
-  function onSamples(chunk) {
-    var a = S.audio;
-    if (!a) return;
-    var level = rms(chunk);
-    $('level-fill').style.width = Math.min(100, level * 600) + '%';
-    a.parts.push(chunk);
-    a.count += chunk.length;
-    if (a.count >= a.ctx.sampleRate * CHUNK_SECONDS) flushChunk();
-  }
-
-  function flushChunk() {
-    var a = S.audio;
-    if (!a || !a.count) return;
-    var all = new Float32Array(a.count), o = 0;
-    a.parts.forEach(function (p) { all.set(p, o); o += p.length; });
-    a.parts = []; a.count = 0;
-    var pcm = downsample(all, a.ctx.sampleRate);
-    if (rms(pcm) < SILENCE_RMS) { $('hearing-label').textContent = 'Quiet'; return; }
-    $('hearing-label').textContent = 'Hearing';
-    sendToStt(encodeWav(pcm));
-  }
-
-  function renderPending() {
-    $('pending').textContent = S.sttPending ? 'transcribing ' + S.sttPending + '…' : '';
-  }
-
-  function sendToStt(wav) {
-    if (!S.status.stt) {
-      if (!S.sttWarned) { S.sttWarned = true; showError('Speech-to-text is off. Add SARVAM_API_KEY to call-guard/.env and restart the server.'); }
-      return;
-    }
-    if (S.sttPending >= MAX_PENDING_STT) return; // network is slow; skip rather than lag behind the call
-    S.sttPending++; renderPending();
-    var session = S.startedAt;
-    S.sttQueue = S.sttQueue
-      .then(function () {
-        return fetch('/api/stt', { method: 'POST', headers: { 'Content-Type': 'audio/wav' }, body: wav });
-      })
-      .then(function (r) { return r.json().then(function (j) { if (!r.ok) throw new Error(j.error || 'Speech-to-text failed.'); return j; }); })
-      .then(function (j) { if (session === S.startedAt && j.text) { showError(''); addLine('Call', j.text); } })
-      .catch(function (e) { showError(e.message); })
-      .then(function () { S.sttPending--; renderPending(); });
-  }
-
   function startAudio(streams, fileBuffer) {
-    var ctx = new (window.AudioContext || window.webkitAudioContext)();
-    return ctx.audioWorklet.addModule('tapWorklet.js').then(function () {
-      var tap = new AudioWorkletNode(ctx, 'ruko-tap');
-      var mute = ctx.createGain(); mute.gain.value = 0;
-      tap.connect(mute); mute.connect(ctx.destination);
-      S.audio = { ctx: ctx, tap: tap, streams: streams, parts: [], count: 0, fileSource: null };
-      tap.port.onmessage = function (e) { onSamples(e.data); };
-      streams.forEach(function (s) {
-        if (s.getAudioTracks().length) ctx.createMediaStreamSource(s).connect(tap);
-        s.getTracks().forEach(function (t) { t.addEventListener('ended', function () { if (S.running && S.source === 'tab' && t.kind === 'audio') stop(); }); });
-      });
-      if (fileBuffer) {
-        return ctx.decodeAudioData(fileBuffer).then(function (decoded) {
-          var src = ctx.createBufferSource();
-          src.buffer = decoded;
-          src.connect(tap);
-          src.connect(ctx.destination); // you hear the recording while it is checked
-          src.onended = function () { if (S.running) { flushChunk(); stop(); } };
-          S.audio.fileSource = src;
-          src.start();
+    var langs = selectedLangs();
+    $('speech-state').textContent = 'Loading speech model…';
+    return Promise.all(langs.map(loadModel)).then(function (models) {
+      if (!S.running) { streams.forEach(function (st) { st.getTracks().forEach(function (t) { t.stop(); }); }); return; }
+      var ctx = makeContext();
+      S.audio = { ctx: ctx, tap: null, streams: streams, fileSource: null };
+      S.recognizers = models.map(function (model, i) {
+        var lang = langs[i];
+        var rec = new model.KaldiRecognizer(ctx.sampleRate);
+        rec.on('partialresult', function (m) { if (S.running) setPartial(lang, m.result.partial); });
+        rec.on('result', function (m) {
+          if (!S.running && !S.audio) return;
+          S.partials[lang] = '';
+          var text = (m.result && m.result.text) || '';
+          if (text.trim()) addLine(langs.length > 1 ? (lang === 'hi' ? 'हिंदी' : 'EN') : 'Call', text);
+          else render();
         });
-      }
+        return rec;
+      });
+      return ctx.audioWorklet.addModule('tapWorklet.js').then(function () {
+        var tap = new AudioWorkletNode(ctx, 'ruko-tap');
+        var mute = ctx.createGain(); mute.gain.value = 0;
+        tap.connect(mute); mute.connect(ctx.destination);
+        S.audio.tap = tap;
+        tap.port.onmessage = function (e) {
+          var chunk = e.data;
+          $('level-fill').style.width = Math.min(100, rms(chunk) * 600) + '%';
+          S.recognizers.forEach(function (rec) { rec.acceptWaveformFloat(chunk, ctx.sampleRate); });
+        };
+        streams.forEach(function (s) {
+          if (s.getAudioTracks().length) ctx.createMediaStreamSource(s).connect(tap);
+          s.getTracks().forEach(function (t) { t.addEventListener('ended', function () { if (S.running && t.kind === 'audio') stop(); }); });
+        });
+        $('speech-state').textContent = 'on-device · ' + langs.map(function (l) { return MODEL_NAMES[l]; }).join(' + ');
+        if (fileBuffer) {
+          return ctx.decodeAudioData(fileBuffer).then(function (decoded) {
+            var src = ctx.createBufferSource();
+            src.buffer = decoded;
+            src.connect(tap);
+            src.connect(ctx.destination); // you hear the recording while it is checked
+            src.onended = function () { if (S.running) setTimeout(stop, 1200); };
+            S.audio.fileSource = src;
+            src.start();
+          });
+        }
+      });
     });
   }
 
   function stopAudio() {
     var a = S.audio;
+    S.recognizers.forEach(function (rec) { try { rec.retrieveFinalResult(); } catch (e) { /* ignore */ } });
+    var recs = S.recognizers;
+    S.recognizers = [];
+    // give the last words a moment to arrive, then free the recognizers
+    setTimeout(function () { recs.forEach(function (rec) { try { rec.remove(); } catch (e) { /* ignore */ } }); S.audio = null; }, 1500);
     if (!a) return;
-    S.audio = null;
-    if (a.parts.length && S.source !== 'file') {
-      // send whatever was left of the last chunk
-      S.audio = a; flushChunk(); S.audio = null;
-    }
     try { if (a.fileSource) a.fileSource.stop(); } catch (e) { /* already stopped */ }
     a.streams.forEach(function (s) { s.getTracks().forEach(function (t) { t.stop(); }); });
-    try { a.tap.port.onmessage = null; a.ctx.close(); } catch (e) { /* closed */ }
+    try { if (a.tap) a.tap.port.onmessage = null; a.ctx.close(); } catch (e) { /* closed */ }
     $('level-fill').style.width = '0%';
   }
 
@@ -469,45 +452,50 @@
     S.demoTimer = setTimeout(next, 600);
   }
 
-  function keepWakeLock(lock) {
-    S.wakeLock = lock;
-    lock.addEventListener('release', function () { if (S.wakeLock === lock) S.wakeLock = null; });
-  }
-
   // ---------- session ----------
   function reset() {
-    S.lines = []; S.spokenDigits = false; S.level = 'safe'; S.score = 0; S.ruleFlags = []; S.ai = null;
-    S.alerted = { caution: false, scam: false }; S.sttWarned = false; S.aiDirty = false;
-    clearTimeout(S.aiTimer); S.aiTimer = null;
+    S.lines = []; S.partials = {}; S.spokenDigits = false; S.level = 'safe'; S.score = 0; S.flags = {};
+    S.fraudType = null; S.isUpiFraud = false; S.alerted = { caution: false, scam: false };
     showError('');
   }
 
-  function start() {
-    if (S.running) return stop();
-    var source = document.querySelector('input[name="source"]:checked').value;
-    if (source !== 'demo' && !window.isSecureContext) {
-      showError('The microphone only works on https:// or http://localhost. Open the app from the server address.');
-      return;
-    }
-    if (source === 'file' && !$('audio-file').files[0]) { showError('Choose an audio file first.'); return; }
-
+  function begin(source) {
     S.source = source;
     reset();
     S.startedAt = Date.now();
-
+    S.running = true;
     if ($('opt-notify').checked && 'Notification' in window && Notification.permission === 'default') {
       Notification.requestPermission().catch(function () {});
     }
     if (navigator.wakeLock) navigator.wakeLock.request('screen').then(keepWakeLock).catch(function () {});
     if ('speechSynthesis' in window) window.speechSynthesis.getVoices();
+    $('start').textContent = 'Stop';
+    $('start').classList.add('stop');
+    $('hearing').hidden = !(source === 'mic' || source === 'tab' || source === 'file');
+    setControlsDisabled(true);
+    S.timerId = setInterval(function () { $('timer').textContent = clock(Date.now() - S.startedAt); }, 500);
+    render();
+  }
+
+  function start() {
+    if (S.running) return stop();
+    var source = document.querySelector('input[name="source"]:checked').value;
+    var live = source === 'mic' || source === 'tab' || source === 'file';
+    if (live && !window.isSecureContext) {
+      showError('The microphone only works on https:// or http://localhost. Open the app from the server address.');
+      return;
+    }
+    if (source === 'file' && !$('audio-file').files[0]) { showError('Choose an audio file first.'); return; }
+
+    begin(source);
 
     var ready;
     if (source === 'demo') {
       var call = DEMO.find(function (c) { return c.id === $('demo-call').value; }) || DEMO[0];
       ready = Promise.resolve().then(function () { runDemo(call); });
     } else if (source === 'mic') {
-      ready = navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: true, autoGainControl: true } })
-        .then(function (mic) { return startAudio([mic]); });
+      ready = navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: true, autoGainControl: true, channelCount: 1 } })
+        .then(function (mic) { if (!S.running) { mic.getTracks().forEach(function (t) { t.stop(); }); return; } return startAudio([mic]); });
     } else if (source === 'tab') {
       ready = navigator.mediaDevices.getDisplayMedia({ video: true, audio: true })
         .then(function (display) {
@@ -523,14 +511,6 @@
       ready = $('audio-file').files[0].arrayBuffer().then(function (buf) { return startAudio([], buf); });
     }
 
-    S.running = true;
-    $('start').textContent = 'Stop';
-    $('start').classList.add('stop');
-    $('hearing').hidden = source === 'demo';
-    setControlsDisabled(true);
-    S.timerId = setInterval(function () { $('timer').textContent = clock(Date.now() - S.startedAt); }, 500);
-    render();
-
     ready.catch(function (e) {
       var msg = e && e.name === 'NotAllowedError' ? 'Permission was refused. Allow microphone or screen sharing access and try again.' : (e && e.message) || 'Could not start listening.';
       stop();
@@ -542,23 +522,28 @@
     if (!S.running) return;
     S.running = false;
     clearTimeout(S.demoTimer);
+    clearTimeout(S.partialTimer); S.partialTimer = null;
     clearInterval(S.timerId);
     stopAudio();
+    S.partials = {};
     if (S.wakeLock) { S.wakeLock.release().catch(function () {}); S.wakeLock = null; }
     $('start').textContent = 'Start listening';
     $('start').classList.remove('stop');
     $('hearing').hidden = true;
+    $('speech-state').textContent = '';
     setControlsDisabled(false);
     if (!S.lines.length) S.level = 'idle';
     render();
   }
 
+  function keepWakeLock(lock) {
+    S.wakeLock = lock;
+    lock.addEventListener('release', function () { if (S.wakeLock === lock) S.wakeLock = null; });
+  }
+
   function setControlsDisabled(on) {
-    document.querySelectorAll('input[name="source"], #demo-call, #audio-file').forEach(function (el) {
-      if (on) el.disabled = true;
-      else el.disabled = false;
-    });
-    if (!on) renderServices();
+    document.querySelectorAll('input[name="source"], #demo-call, #audio-file, #speech-lang').forEach(function (el) { el.disabled = on; });
+    if (!on) renderSpeechStatus();
   }
 
   function syncSourceOptions() {
@@ -567,6 +552,18 @@
     $('opt-file').hidden = v !== 'file';
     $('opt-mic').hidden = v !== 'mic';
     $('opt-tab').hidden = v !== 'tab';
+    $('opt-lang').hidden = v === 'demo';
+  }
+
+  // Typed sentences go through exactly the same checks and alarm as speech.
+  function addTyped(e) {
+    e.preventDefault();
+    var text = $('type-text').value.trim();
+    if (!text) return;
+    if (!S.running) begin('text');
+    addLine('Typed', text);
+    $('type-text').value = '';
+    $('type-text').focus();
   }
 
   // ---------- wire up ----------
@@ -575,6 +572,7 @@
   }).join('');
   document.querySelectorAll('input[name="source"]').forEach(function (r) { r.addEventListener('change', syncSourceOptions); });
   $('start').addEventListener('click', start);
+  $('type-form').addEventListener('submit', addTyped);
   $('keep').addEventListener('click', closeAlarm);
   $('hung-up').addEventListener('click', function () {
     stop();
@@ -595,10 +593,10 @@
 
   syncSourceOptions();
   render();
-  loadStatus().then(function () {
-    if (S.status.stt) { $('src-mic').checked = true; syncSourceOptions(); }
+  detectModels().then(function () {
+    if (S.models.hi || S.models['en-in']) { $('src-mic').checked = true; syncSourceOptions(); }
   });
 
   // Exposed for automated tests only.
-  window.__rukoCallGuard = { state: S, addLine: addLine, encodeWav: encodeWav, downsample: downsample };
+  window.__rukoCallGuard = { state: S, addLine: addLine, setPartial: setPartial, evaluate: evaluate };
 })();

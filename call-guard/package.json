@@ -1,13 +1,17 @@
 {
   "name": "ruko-call-guard",
-  "version": "1.0.0",
-  "description": "Live scam-call warning: listens to a call, transcribes it with Sarvam, checks it with keyword rules and OpenAI, and tells you to hang up.",
+  "version": "2.0.0",
+  "description": "Live scam-call warning that runs fully on the device: offline speech recognition (Vosk) plus a rule-based fraud detector. No API keys, no cloud.",
   "private": true,
   "main": "server.js",
   "engines": { "node": ">=20.12" },
   "scripts": {
     "start": "node server.js",
+    "models": "node scripts/get-models.js",
     "test": "node --test"
+  },
+  "dependencies": {
+    "vosk-browser": "0.0.8"
   },
   "license": "MIT"
 }

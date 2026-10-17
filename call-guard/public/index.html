@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Ruko Call Guard</title>
-<meta name="description" content="Live scam-call warning: listens to your call and tells you to hang up when the caller asks for OTP, card details or threatens a digital arrest.">
+<meta name="description" content="Live scam-call warning that runs fully on your device: offline speech recognition and rule-based fraud detection. No cloud, no API keys.">
 <meta name="claude:viewport-fit-sides" content="cover">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -160,8 +160,20 @@ mark { background: var(--mark); color: var(--mark-ink); border-radius: 3px; padd
 .pill.src-ai { background: var(--paper); color: var(--accent); border: 1px solid var(--line); }
 .flag .quote { font-family: var(--font-mono); font-size: .8rem; color: var(--muted); overflow-wrap: anywhere; }
 .flag .why { font-size: .88rem; }
-.ai-box { border: 1px solid var(--line); border-radius: 10px; padding: 12px; display: grid; gap: 6px; background: var(--paper); font-size: .92rem; }
-.ai-box .say { font-weight: 700; }
+.advice { border: 1px solid var(--line); border-radius: 10px; padding: 12px; display: grid; gap: 6px; background: var(--paper); font-size: .92rem; }
+.advice .eyebrow { color: var(--ink); }
+.verdict-row { display: flex; flex-wrap: wrap; gap: 8px; }
+.type-pill, .upi-pill { font-size: .8rem; font-weight: 700; padding: 4px 10px; border-radius: 999px; border: 1px solid currentColor; }
+.type-pill { color: var(--ink); background: var(--surface); }
+.upi-pill { color: var(--surface); background: var(--danger); border-color: var(--danger); }
+.upi-pill[data-upi="false"] { color: var(--muted); background: transparent; border-color: var(--line); }
+.type-form { display: grid; gap: 6px; border-top: 1px solid var(--line); padding-top: 12px; }
+.type-row { display: flex; gap: 8px; }
+.type-row input { flex: 1; min-width: 0; font: inherit; font-size: .95rem; color: var(--ink); background: var(--paper); border: 1px solid var(--line); border-radius: 10px; padding: 9px 12px; }
+.btn.small { padding: 9px 14px; font-size: .92rem; border-radius: 10px; }
+.transcript li.partial { background: transparent; border: 1px dashed var(--accent); }
+.transcript li.partial .txt { color: var(--muted); font-style: italic; }
+.privacy { font-size: .82rem; color: var(--safe); font-weight: 700; }
 
 .rules { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 10px; }
 .rules li { border: 1px solid var(--line); border-radius: 10px; padding: 12px; display: grid; gap: 4px; }
@@ -207,12 +219,12 @@ footer { font-size: .82rem; color: var(--muted); }
     <div class="brand">
       <p class="eyebrow">Live scam-call warning</p>
       <h1>Ruko<span>.</span> Call Guard</h1>
-      <p>Keep this page open during a call. It listens, and warns you the moment the caller asks for an OTP, card details or PIN, or starts a "digital arrest" threat.</p>
+      <p>Keep this page open during a call. It listens, and warns you the moment the caller asks for an OTP, card details or PIN, pushes a UPI "scan to receive" trick, or starts a "digital arrest" threat.</p>
     </div>
-    <div class="services" aria-label="Services">
-      <span class="svc" id="svc-stt" data-on="false">Speech-to-text: Sarvam</span>
-      <span class="svc" id="svc-ai" data-on="false">AI check: OpenAI</span>
-      <span class="svc" data-on="true">Keyword detector</span>
+    <div class="services" aria-label="How it works">
+      <span class="svc" id="svc-speech" data-on="false">Speech: checking…</span>
+      <span class="svc" data-on="true">Fraud check: on-device rules</span>
+      <span class="privacy">No cloud. Nothing leaves this device.</span>
     </div>
   </header>
 
@@ -223,6 +235,10 @@ footer { font-size: .82rem; color: var(--muted); }
         <span class="timer" id="timer">00:00</span>
       </div>
       <h2 id="state-title">Ready when your call starts</h2>
+      <div class="verdict-row" id="verdict-row" hidden>
+        <span class="type-pill" id="type-pill"></span>
+        <span class="upi-pill" id="upi-pill" data-upi="false">UPI fraud: No</span>
+      </div>
       <p class="sub" id="state-sub">Pick how to listen, then press Start.</p>
       <p class="sub-hi hi" id="state-sub-hi" lang="hi">कॉल शुरू होते ही Start दबाएँ।</p>
       <div>
@@ -232,7 +248,7 @@ footer { font-size: .82rem; color: var(--muted); }
       <div class="hearing" id="hearing" hidden>
         <span id="hearing-label">Hearing</span>
         <span class="level-bar"><span id="level-fill"></span></span>
-        <span id="pending"></span>
+        <span id="speech-state"></span>
       </div>
     </section>
 
@@ -244,7 +260,7 @@ footer { font-size: .82rem; color: var(--muted); }
           <label class="src"><input type="radio" name="source" id="src-mic" value="mic"><b>Phone on speaker</b><small>Microphone hears the call</small></label>
           <label class="src"><input type="radio" name="source" id="src-tab" value="tab"><b>Browser call</b><small>WhatsApp Web, Meet: tab audio + mic</small></label>
           <label class="src"><input type="radio" name="source" id="src-file" value="file"><b>Recorded call</b><small>Play an audio file through it</small></label>
-          <label class="src"><input type="radio" name="source" id="src-demo" value="demo" checked><b>Demo call</b><small>Scripted calls, no keys needed</small></label>
+          <label class="src"><input type="radio" name="source" id="src-demo" value="demo" checked><b>Demo call</b><small>Scripted calls, works offline</small></label>
         </div>
       </fieldset>
 
@@ -256,6 +272,15 @@ footer { font-size: .82rem; color: var(--muted); }
         <label for="audio-file">Audio file (mp3, wav, m4a)</label>
         <input type="file" id="audio-file" accept="audio/*">
       </div>
+      <div class="opt" id="opt-lang" hidden>
+        <label for="speech-lang">Call language</label>
+        <select id="speech-lang">
+          <option value="hi">हिंदी / Hinglish</option>
+          <option value="en-in">English (India)</option>
+          <option value="both">Both (uses more battery)</option>
+        </select>
+      </div>
+      <p class="note" id="model-note" hidden></p>
       <p class="note" id="opt-mic" hidden>Put your call on <b>speaker</b> and keep this page open on a laptop or second phone next to it. Most phones do not let a web page hear an active call directly.</p>
       <p class="note" id="opt-tab" hidden>When the browser asks, pick the tab with your call and turn on <b>"Share tab audio"</b>. Your own voice comes from the mic.</p>
 
@@ -276,11 +301,18 @@ footer { font-size: .82rem; color: var(--muted); }
         <span class="eyebrow">Numbers hidden as ••••</span>
       </div>
       <ul class="transcript" id="transcript"><li class="empty">The call's words will appear here as they are heard.</li></ul>
+      <form class="type-form" id="type-form" autocomplete="off">
+        <label class="eyebrow" for="type-text">Test it: type what a caller might say</label>
+        <div class="type-row">
+          <input type="text" id="type-text" placeholder='e.g. "QR scan karo, paise aa jayenge"'>
+          <button class="btn small" type="submit">Add</button>
+        </div>
+      </form>
     </section>
 
     <section class="panel" aria-labelledby="fl-h">
       <h2 id="fl-h">Why we're warning you</h2>
-      <div class="ai-box" id="ai-box" hidden></div>
+      <div class="advice" id="advice" hidden></div>
       <ul class="flags" id="flags"><li class="empty">No warning signs yet.</li></ul>
     </section>
   </div>
@@ -288,6 +320,7 @@ footer { font-size: .82rem; color: var(--muted); }
   <section class="panel" aria-labelledby="rules-h">
     <h2 id="rules-h">Remember on every call</h2>
     <ul class="rules">
+      <li><b>A PIN or QR scan never brings money</b><span>Scanning, approving a request or entering your UPI PIN always sends money out. पैसे पाने के लिए PIN नहीं लगता।</span></li>
       <li><b>No one needs your OTP</b><span>Not your bank, not the police, not delivery. OTP किसी को न बताएं।</span></li>
       <li><b>"Digital arrest" does not exist</b><span>Police never arrest or question you on a video call or ask for money to clear your name.</span></li>
       <li><b>Secrecy is the scam</b><span>"Don't tell anyone, don't cut the call" is what fraudsters say. Hang up and tell family.</span></li>
@@ -301,7 +334,7 @@ footer { font-size: .82rem; color: var(--muted); }
     </div>
   </section>
 
-  <footer>Ruko Call Guard is a prototype. Audio is sent to Sarvam only to turn speech into text; long numbers are hidden before text is sent to OpenAI. Nothing is saved. It can miss scams or raise false alarms, so trust the rules above too.</footer>
+  <footer>Ruko Call Guard is a prototype. Speech recognition (Vosk) and fraud detection run inside this browser: no audio or text is sent anywhere, and nothing is saved. Long numbers are hidden as ••••. It can miss scams or raise false alarms, so trust the rules above too.</footer>
 </div>
 
 <div class="alarm" id="alarm" role="alertdialog" aria-modal="true" aria-labelledby="alarm-title" hidden>
@@ -310,7 +343,8 @@ footer { font-size: .82rem; color: var(--muted); }
     <p class="big" id="alarm-title">Hang up now.</p>
     <p class="big-hi" lang="hi">यह धोखाधड़ी कॉल है। फोन काट दें।</p>
     <ul id="alarm-reasons"></ul>
-    <p>Do not share any OTP, card number, CVV or PIN. Do not send money. <span lang="hi">OTP, कार्ड नंबर या PIN किसी को न बताएं।</span></p>
+    <p id="alarm-advice">Do not share any OTP, card number, CVV or PIN. Do not send money.</p>
+    <p lang="hi" id="alarm-advice-hi">OTP, कार्ड नंबर या PIN किसी को न बताएं।</p>
     <div class="say-box">
       <span class="eyebrow">Say this and hang up</span>
       <span id="alarm-say">"I will call my bank myself on the official number. Goodbye."</span>
@@ -332,7 +366,7 @@ footer { font-size: .82rem; color: var(--muted); }
   </div>
 </div>
 
-<script src="scamRules.js"></script>
+<script src="fraudRules.js"></script>
 <script src="demoCalls.js"></script>
 <script src="app.js"></script>
 </body>

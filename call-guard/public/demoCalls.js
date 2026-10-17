@@ -55,6 +55,20 @@
       ]
     },
     {
+      id: 'upi-collect',
+      label: 'UPI "accept request to get paid" (OLX buyer)',
+      expected: 'scam',
+      lang: 'hi-IN',
+      lines: [
+        ['Caller', 'Hello, main OLX se bol raha hoon, aapka sofa kharidna hai.'],
+        ['You', 'Haan ji, 12,000 ka hai.'],
+        ['Caller', 'Theek hai, main army mein hoon, abhi payment kar deta hoon.'],
+        ['Caller', 'Maine aapko collect request bheji hai, accept kar do, paise aa jayenge.'],
+        ['You', 'Accept karne pe PIN maang raha hai.'],
+        ['Caller', 'Haan, UPI PIN daal do, tabhi paise aapke account mein aa jayenge. Jaldi karo.']
+      ]
+    },
+    {
       id: 'normal-bank',
       label: 'Normal bill reminder from a bank',
       expected: 'safe',

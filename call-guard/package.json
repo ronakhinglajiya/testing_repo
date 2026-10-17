@@ -1,0 +1,13 @@
+{
+  "name": "ruko-call-guard",
+  "version": "1.0.0",
+  "description": "Live scam-call warning: listens to a call, transcribes it with Sarvam, checks it with keyword rules and OpenAI, and tells you to hang up.",
+  "private": true,
+  "main": "server.js",
+  "engines": { "node": ">=20.12" },
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test"
+  },
+  "license": "MIT"
+}

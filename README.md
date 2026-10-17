@@ -2,6 +2,10 @@
 
 *"Ruko" means "stop" in Hindi.*
 
+> This repo has two tools:
+> - **Ruko UPI Check** (this page): checks a payment request, QR code, SMS or link before you pay.
+> - **[Ruko Call Guard](call-guard/README.md)**: listens to a live phone call and warns you to hang up when the caller asks for OTP or card details, or threatens a "digital arrest".
+
 Ruko UPI Check is a small prototype that checks a UPI payment request, QR code, SMS or link **before** you pay. It points out the warning signs, explains each one in simple language, and tells you what to do next:
 
 - **Do not share your PIN**

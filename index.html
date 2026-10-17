@@ -1,0 +1,475 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Ruko UPI Check</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&family=Bricolage+Grotesque:opsz,wght@12..96,600;12..96,800&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+/* Layout: a payment-app "interception sheet". Request on the left, verdict on the right; checklist and test run below. */
+:root {
+  --paper: #F2F5F3;
+  --surface: #FFFFFF;
+  --ink: #13201C;
+  --muted: #56655F;
+  --line: #D8E0DC;
+  --accent: #0B6E5B;
+  --accent-ink: #FFFFFF;
+  --safe: #1C7A4B;   --safe-bg: #E3F3EA;
+  --warn: #A86300;   --warn-bg: #FBEFD9;
+  --danger: #BF331C; --danger-bg: #FBE6E1;
+  --mark: #FFE08A;   --mark-ink: #13201C;
+  --font-display: "Bricolage Grotesque", "Segoe UI", system-ui, sans-serif;
+  --font-body: "Atkinson Hyperlegible", "Segoe UI", system-ui, -apple-system, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+  --radius: 14px;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper: #0E1412; --surface: #162019; --ink: #E4EDE8; --muted: #98A8A1; --line: #29362F;
+    --accent: #4CC3A6; --accent-ink: #062019;
+    --safe: #5BCB8F; --safe-bg: #15301F; --warn: #F2B04A; --warn-bg: #36280F; --danger: #FF7C64; --danger-bg: #3A1A14;
+    --mark: #6B5414; --mark-ink: #FFF3CC;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --paper: #0E1412; --surface: #162019; --ink: #E4EDE8; --muted: #98A8A1; --line: #29362F;
+  --accent: #4CC3A6; --accent-ink: #062019;
+  --safe: #5BCB8F; --safe-bg: #15301F; --warn: #F2B04A; --warn-bg: #36280F; --danger: #FF7C64; --danger-bg: #3A1A14;
+  --mark: #6B5414; --mark-ink: #FFF3CC;
+  color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+html, body { margin: 0; }
+body {
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--font-body);
+  font-size: 16px;
+  line-height: 1.5;
+}
+.wrap {
+  max-width: 1120px;
+  margin: 0 auto;
+  padding-block: 28px 56px;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  display: grid;
+  gap: 28px;
+}
+h1, h2, h3 { font-family: var(--font-display); text-wrap: balance; margin: 0; line-height: 1.15; }
+h2 { font-size: 1.35rem; font-weight: 800; }
+h3 { font-size: 1.05rem; font-weight: 600; }
+p { margin: 0; }
+.eyebrow { font-size: .75rem; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); font-weight: 700; }
+.mono { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
+
+/* header */
+header.top { display: flex; flex-wrap: wrap; align-items: end; justify-content: space-between; gap: 16px; }
+.brand { display: grid; gap: 6px; max-width: 62ch; }
+.brand h1 { font-size: clamp(2rem, 5vw, 2.8rem); font-weight: 800; letter-spacing: -.02em; }
+.brand h1 span { color: var(--accent); }
+.brand p { color: var(--muted); }
+.demo-tag {
+  font-size: .8rem; color: var(--muted); border: 1px dashed var(--line); border-radius: 999px;
+  padding: 6px 12px; background: var(--surface);
+}
+
+/* main grid */
+.grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.1fr); gap: 20px; align-items: start; }
+@media (max-width: 860px) { .grid { grid-template-columns: minmax(0, 1fr); } }
+.panel { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); padding: 20px; display: grid; gap: 18px; min-width: 0; }
+
+/* samples */
+.samples { display: flex; flex-wrap: wrap; gap: 8px; }
+.chip {
+  font: inherit; font-size: .88rem; cursor: pointer; border-radius: 999px; padding: 6px 12px;
+  border: 1px solid var(--line); background: var(--paper); color: var(--ink); display: inline-flex; align-items: center; gap: 6px;
+}
+.chip::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: var(--danger); }
+.chip[data-expected="low"]::before { background: var(--safe); }
+.chip[aria-pressed="true"] { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
+
+/* form */
+form { display: grid; gap: 14px; }
+.field { display: grid; gap: 6px; min-width: 0; }
+.field label, .field legend { font-weight: 700; font-size: .9rem; }
+.row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+@media (max-width: 480px) { .row { grid-template-columns: 1fr; } }
+input[type="text"], input[type="number"], textarea {
+  font: inherit; color: var(--ink); background: var(--paper); border: 1px solid var(--line);
+  border-radius: 10px; padding: 10px 12px; width: 100%;
+}
+textarea { min-height: 120px; resize: vertical; }
+#upiId, #amount { font-family: var(--font-mono); font-size: .92rem; }
+fieldset { border: 0; padding: 0; margin: 0; display: grid; gap: 6px; }
+.seg { display: grid; grid-template-columns: repeat(4, 1fr); gap: 0; border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+@media (max-width: 480px) { .seg { grid-template-columns: 1fr 1fr; } }
+.seg label { position: relative; text-align: center; font-weight: 400; font-size: .86rem; padding: 9px 6px; cursor: pointer; background: var(--paper); border-right: 1px solid var(--line); }
+.seg label:last-child { border-right: 0; }
+.seg input { position: absolute; opacity: 0; inset: 0; cursor: pointer; }
+.seg label:has(input:checked) { background: var(--accent); color: var(--accent-ink); font-weight: 700; }
+.seg label:has(input:focus-visible) { outline: 3px solid var(--accent); outline-offset: -3px; }
+.hint { font-size: .82rem; color: var(--muted); }
+.hint strong { color: var(--danger); }
+.check { display: flex; gap: 10px; align-items: flex-start; font-size: .92rem; }
+.check input { width: 18px; height: 18px; margin-top: 2px; accent-color: var(--accent); }
+.btn {
+  font: inherit; font-weight: 700; cursor: pointer; border-radius: 10px; padding: 11px 16px;
+  border: 1px solid var(--accent); background: var(--accent); color: var(--accent-ink);
+}
+.btn.ghost { background: transparent; color: var(--ink); border-color: var(--line); }
+.btn.danger { background: var(--danger); border-color: var(--danger); color: var(--surface); }
+
+/* verdict */
+.verdict { border-radius: var(--radius); padding: 18px 20px; display: grid; gap: 12px; background: var(--safe-bg); border: 1px solid var(--safe); }
+.verdict[data-level="medium"] { background: var(--warn-bg); border-color: var(--warn); }
+.verdict[data-level="high"] { background: var(--danger-bg); border-color: var(--danger); }
+.verdict .level { display: inline-flex; align-items: center; gap: 8px; font-weight: 700; font-size: .8rem; text-transform: uppercase; letter-spacing: .08em; color: var(--safe); }
+.verdict[data-level="medium"] .level { color: var(--warn); }
+.verdict[data-level="high"] .level { color: var(--danger); }
+.verdict .level::before { content: ""; width: 10px; height: 10px; border-radius: 50%; background: currentColor; }
+.verdict h2 { font-size: clamp(1.6rem, 4vw, 2.1rem); }
+.meter { position: relative; height: 10px; border-radius: 999px; background: linear-gradient(90deg, var(--safe) 0 20%, var(--warn) 20% 50%, var(--danger) 50% 100%); opacity: .9; }
+.meter .pin { position: absolute; top: 50%; width: 18px; height: 18px; border-radius: 50%; background: var(--surface); border: 3px solid var(--ink); transform: translate(-50%, -50%); transition: left .3s ease; }
+.meter-scale { position: relative; height: 1.4em; margin-top: 4px; font-size: .75rem; color: var(--muted); }
+.meter-scale span { position: absolute; top: 0; }
+.meter-scale .t20 { left: 20%; transform: translateX(-50%); } .meter-scale .t50 { left: 50%; transform: translateX(-50%); } .meter-scale .end { right: 0; }
+@media (prefers-reduced-motion: reduce) { .meter .pin { transition: none; } }
+
+.redacted { border: 1px solid var(--danger); background: var(--danger-bg); color: var(--ink); border-radius: 10px; padding: 10px 12px; font-size: .9rem; }
+
+.quote { background: var(--paper); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; font-size: .95rem; overflow-wrap: anywhere; }
+mark { background: var(--mark); color: var(--mark-ink); border-radius: 3px; padding: 0 2px; }
+
+.flags { list-style: none; margin: 0; padding: 0; display: grid; gap: 10px; }
+.flag { border: 1px solid var(--line); border-left: 4px solid var(--warn); border-radius: 10px; padding: 12px 14px; display: grid; gap: 6px; min-width: 0; }
+.flag[data-sev="critical"] { border-left-color: var(--danger); }
+.flag[data-sev="high"] { border-left-color: var(--danger); }
+.flag[data-sev="low"] { border-left-color: var(--muted); }
+.flag-head { display: flex; justify-content: space-between; gap: 10px; align-items: baseline; flex-wrap: wrap; }
+.sev { font-size: .7rem; font-weight: 700; text-transform: uppercase; letter-spacing: .08em; padding: 2px 8px; border-radius: 999px; background: var(--warn-bg); color: var(--warn); }
+.sev[data-sev="critical"], .sev[data-sev="high"] { background: var(--danger-bg); color: var(--danger); }
+.sev[data-sev="low"] { background: var(--paper); color: var(--muted); }
+.flag .detail { font-size: .88rem; color: var(--muted); overflow-wrap: anywhere; }
+.flag dl { margin: 0; display: grid; grid-template-columns: max-content 1fr; gap: 2px 10px; font-size: .9rem; }
+.flag dt { font-weight: 700; }
+.flag dd { margin: 0; }
+.none { color: var(--muted); font-size: .92rem; }
+
+.decide { display: flex; flex-wrap: wrap; gap: 10px; }
+.outcome { font-size: .92rem; border-radius: 10px; padding: 10px 12px; background: var(--paper); border: 1px solid var(--line); }
+
+/* lower sections */
+.lower { display: grid; grid-template-columns: minmax(0, .9fr) minmax(0, 1.1fr); gap: 20px; align-items: start; }
+@media (max-width: 860px) { .lower { grid-template-columns: minmax(0, 1fr); } }
+.checklist { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; }
+.checklist label { display: flex; gap: 10px; align-items: flex-start; cursor: pointer; }
+.checklist input { width: 18px; height: 18px; margin-top: 3px; accent-color: var(--accent); flex: none; }
+.checklist label:has(input:checked) span { color: var(--muted); text-decoration: line-through; }
+.help { display: grid; gap: 4px; padding: 12px 14px; border-radius: 10px; background: var(--paper); border: 1px solid var(--line); font-size: .92rem; }
+.help .num { font-family: var(--font-mono); font-weight: 600; font-size: 1.3rem; color: var(--accent); user-select: all; }
+
+.table-wrap { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; font-size: .88rem; min-width: 500px; }
+th, td { text-align: left; padding: 9px 6px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { font-size: .72rem; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+td.num { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+.lvl { font-weight: 700; text-transform: uppercase; font-size: .75rem; letter-spacing: .06em; }
+.lvl.low { color: var(--safe); } .lvl.medium { color: var(--warn); } .lvl.high { color: var(--danger); }
+.pass { color: var(--safe); font-weight: 700; } .fail { color: var(--danger); font-weight: 700; }
+.tags { display: flex; flex-wrap: wrap; gap: 4px; }
+.tag { font-family: var(--font-mono); font-size: .72rem; padding: 1px 6px; border-radius: 6px; background: var(--paper); border: 1px solid var(--line); }
+
+footer { font-size: .82rem; color: var(--muted); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="top">
+    <div class="brand">
+      <p class="eyebrow">Stop fraud before payment</p>
+      <h1>Ruko<span>.</span> UPI Check</h1>
+      <p>Paste a payment request, QR code text, SMS or link. See the warning signs and what to do <em>before</em> you enter your PIN.</p>
+    </div>
+    <p class="demo-tag">Demo with sample data. No bank connection. No real payments.</p>
+  </header>
+
+  <div class="grid">
+    <!-- request -->
+    <section class="panel" aria-labelledby="req-h">
+      <div class="field">
+        <h2 id="req-h">The request</h2>
+        <p class="hint">Try an example, or edit the fields. The check updates as you type.</p>
+      </div>
+      <div class="samples" id="samples" role="group" aria-label="Example requests"></div>
+
+      <form id="form" autocomplete="off" novalidate>
+        <fieldset>
+          <legend>What did you get?</legend>
+          <div class="seg">
+            <label><input type="radio" name="kind" id="kind-collect" value="collect">Collect request</label>
+            <label><input type="radio" name="kind" id="kind-qr" value="qr">QR code</label>
+            <label><input type="radio" name="kind" id="kind-message" value="message">SMS / link</label>
+            <label><input type="radio" name="kind" id="kind-pay" value="pay">I'm paying</label>
+          </div>
+        </fieldset>
+        <div class="row">
+          <div class="field">
+            <label for="name">Sender name</label>
+            <input type="text" id="name" placeholder="e.g. Priya Sharma">
+          </div>
+          <div class="field">
+            <label for="upiId">UPI ID</label>
+            <input type="text" id="upiId" placeholder="name@bank" spellcheck="false">
+          </div>
+        </div>
+        <div class="field">
+          <label for="amount">Amount (₹)</label>
+          <input type="number" id="amount" min="0" step="1" inputmode="numeric" placeholder="0">
+        </div>
+        <div class="field">
+          <label for="text">Message, note or link</label>
+          <textarea id="text" placeholder="Paste the SMS, WhatsApp message, payment note or QR text"></textarea>
+          <p class="hint"><strong>Never type your real UPI PIN or OTP here.</strong> This tool never needs it and does not save anything.</p>
+        </div>
+        <label class="check"><input type="checkbox" id="known"> <span>I know this person and have paid them before</span></label>
+        <button class="btn" type="submit">Check risk</button>
+      </form>
+    </section>
+
+    <!-- result -->
+    <section class="panel" id="result" aria-live="polite" aria-labelledby="verdict-h">
+      <div class="verdict" id="verdict" data-level="low">
+        <span class="level" id="level">Low risk</span>
+        <h2 id="verdict-h">Looks okay</h2>
+        <p id="summary"></p>
+        <div>
+          <div class="meter" aria-hidden="true"><span class="pin" id="pin" style="left:0%"></span></div>
+          <div class="meter-scale"><span>0</span><span class="t20">20</span><span class="t50">50</span><span class="end mono" id="score">0 / 100</span></div>
+        </div>
+      </div>
+
+      <p class="redacted" id="redacted" hidden>It looks like a PIN or OTP was typed in the message. We hid it (••••) and did not save it. If it is real, change it in your bank app now.</p>
+
+      <div class="field">
+        <h3>Warning signs in the message</h3>
+        <div class="quote" id="quote"></div>
+      </div>
+
+      <div class="field">
+        <h3 id="flags-h">Why we flagged it</h3>
+        <ul class="flags" id="flags"></ul>
+      </div>
+
+      <div class="field">
+        <h3>What do you want to do?</h3>
+        <div class="decide">
+          <button class="btn danger" type="button" id="decline">Decline / don't pay</button>
+          <button class="btn ghost" type="button" id="verify">I'll verify first</button>
+          <button class="btn ghost" type="button" id="continue">Continue anyway</button>
+        </div>
+        <p class="outcome" id="outcome" hidden></p>
+      </div>
+    </section>
+  </div>
+
+  <div class="lower">
+    <section class="panel" aria-labelledby="cl-h">
+      <h2 id="cl-h">Before you pay: 9 rules</h2>
+      <ul class="checklist" id="checklist"></ul>
+      <div class="help">
+        <span class="eyebrow">Already lost money?</span>
+        <span>Call the National Cyber Crime Helpline <span class="num">1930</span></span>
+        <span>or report at <a href="https://cybercrime.gov.in" target="_blank" rel="noopener">cybercrime.gov.in</a>. Report fast; the first hours matter most.</span>
+      </div>
+    </section>
+
+    <section class="panel" aria-labelledby="t-h">
+      <div class="field">
+        <h2 id="t-h">Test run</h2>
+        <p class="hint">Every example above, checked by the same engine when this page loaded.</p>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Example</th><th>Expected</th><th>Result</th><th>Score</th><th>Warning signs triggered</th><th>OK</th></tr></thead>
+          <tbody id="tests"></tbody>
+        </table>
+      </div>
+    </section>
+  </div>
+
+  <footer>Ruko UPI Check is a prototype. It uses fictional sample data, runs fully in your browser, stores nothing, and cannot send or receive money. It does not replace your bank's own warnings.</footer>
+</div>
+
+<script src="riskEngine.js"></script>
+<script>
+(function () {
+  'use strict';
+  var E = window.RiskEngine;
+  var $ = function (id) { return document.getElementById(id); };
+  var LEVEL_LABEL = { low: 'Low risk', medium: 'Medium risk', high: 'High risk' };
+  var current = null;
+
+  function esc(s) {
+    return String(s).replace(/[&<>"']/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+    });
+  }
+
+  // Wrap every occurrence of each matched phrase in <mark>, escaping everything else.
+  function highlight(text, phrases) {
+    var lower = text.toLowerCase();
+    var ranges = [];
+    phrases.forEach(function (p) {
+      if (!p) return;
+      var q = p.toLowerCase(), i = 0;
+      while ((i = lower.indexOf(q, i)) !== -1) { ranges.push([i, i + q.length]); i += q.length; }
+    });
+    ranges.sort(function (a, b) { return a[0] - b[0]; });
+    var merged = [];
+    ranges.forEach(function (r) {
+      var last = merged[merged.length - 1];
+      if (last && r[0] <= last[1]) last[1] = Math.max(last[1], r[1]); else merged.push(r.slice());
+    });
+    var out = '', pos = 0;
+    merged.forEach(function (r) {
+      out += esc(text.slice(pos, r[0])) + '<mark>' + esc(text.slice(r[0], r[1])) + '</mark>';
+      pos = r[1];
+    });
+    return out + esc(text.slice(pos));
+  }
+
+  function readForm() {
+    var kind = document.querySelector('input[name="kind"]:checked');
+    return {
+      kind: kind ? kind.value : 'message',
+      name: $('name').value,
+      upiId: $('upiId').value,
+      amount: $('amount').value,
+      text: $('text').value,
+      knownContact: $('known').checked
+    };
+  }
+
+  function fillForm(input) {
+    $('kind-' + input.kind).checked = true;
+    $('name').value = input.name || '';
+    $('upiId').value = input.upiId || '';
+    $('amount').value = input.amount || '';
+    $('text').value = input.text || '';
+    $('known').checked = !!input.knownContact;
+  }
+
+  function render() {
+    var input = readForm();
+    var r = E.analyze(input);
+    current = r;
+
+    // A PIN/OTP typed into the box is masked in the field itself, never kept.
+    if (r.secretRedacted && $('text').value !== r.cleanText) $('text').value = r.cleanText;
+    $('redacted').hidden = !r.secretRedacted;
+
+    $('verdict').dataset.level = r.level;
+    $('level').textContent = LEVEL_LABEL[r.level];
+    $('verdict-h').textContent = r.headline;
+    $('summary').textContent = r.flags.length
+      ? r.flags.length + ' warning sign' + (r.flags.length > 1 ? 's' : '') + ' found. ' + r.actions[0]
+      : 'No warning signs found. ' + r.actions[0];
+    $('pin').style.left = r.score + '%';
+    $('score').textContent = r.score + ' / 100';
+
+    var phrases = [];
+    r.flags.forEach(function (f) { phrases = phrases.concat(f.matches); });
+    $('quote').innerHTML = r.cleanText.trim()
+      ? highlight(r.cleanText, phrases)
+      : '<span class="none">No message entered.</span>';
+
+    $('flags').innerHTML = r.flags.length ? r.flags.map(function (f) {
+      return '<li class="flag" data-sev="' + f.severity + '">' +
+        '<div class="flag-head"><h3>' + esc(f.title) + '</h3><span class="sev" data-sev="' + f.severity + '">' + f.severity + ' · +' + f.points + '</span></div>' +
+        '<p class="detail">' + esc(f.detail) + '</p>' +
+        '<dl><dt>Why</dt><dd>' + esc(f.why) + '</dd><dt>Do this</dt><dd>' + esc(f.action) + '</dd></dl>' +
+        '</li>';
+    }).join('') : '<li class="none">Nothing suspicious found. Still check that the name your UPI app shows is the person you meant to pay.</li>';
+
+    $('outcome').hidden = true;
+  }
+
+  function decide(choice) {
+    var r = current, msg;
+    if (choice === 'decline') {
+      msg = 'Declined (demo). Nothing was paid. If you already shared a PIN or OTP, call your bank and 1930 now.';
+    } else if (choice === 'verify') {
+      msg = 'Good call. Hang up or close the chat, then call the person or company on a number you already trust (from your contacts, the back of your card, or their official website). Do not use numbers from the message.';
+    } else if (r.level === 'high') {
+      msg = 'Stop. This request has ' + r.flags.length + ' warning signs, including "' + r.flags[0].title + '". A real payment app would block it here. (Demo only: no money moves.)';
+    } else if (r.level === 'medium') {
+      msg = 'Only continue after you have verified the sender. In the real app you would now see the payee name: make sure it matches. (Demo only: no money moves.)';
+    } else {
+      msg = 'Looks okay. Check the name your app shows, then pay. (Demo only: no money moves.)';
+    }
+    $('outcome').textContent = msg;
+    $('outcome').hidden = false;
+  }
+
+  function selectSample(sample, btn) {
+    fillForm(sample.input);
+    Array.prototype.forEach.call(document.querySelectorAll('.chip'), function (c) { c.setAttribute('aria-pressed', String(c === btn)); });
+    render();
+  }
+
+  // Sample chips
+  E.SAMPLES.forEach(function (s, i) {
+    var b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'chip';
+    b.dataset.expected = s.expected;
+    b.setAttribute('aria-pressed', 'false');
+    b.textContent = s.label;
+    b.title = s.expected === 'low' ? 'Normal example' : 'Suspicious example';
+    b.addEventListener('click', function () { selectSample(s, b); });
+    $('samples').appendChild(b);
+  });
+
+  // Checklist
+  $('checklist').innerHTML = E.CHECKLIST.map(function (item, i) {
+    return '<li><label><input type="checkbox" id="cl-' + i + '"><span>' + esc(item) + '</span></label></li>';
+  }).join('');
+
+  // Test run table
+  $('tests').innerHTML = E.SAMPLES.map(function (s) {
+    var r = E.analyze(s.input);
+    var ok = r.level === s.expected;
+    return '<tr><td>' + esc(s.label) + '</td>' +
+      '<td><span class="lvl ' + s.expected + '">' + s.expected + '</span></td>' +
+      '<td><span class="lvl ' + r.level + '">' + r.level + '</span></td>' +
+      '<td class="num">' + r.score + '</td>' +
+      '<td><div class="tags">' + (r.flags.length ? r.flags.map(function (f) { return '<span class="tag">' + f.id + '</span>'; }).join('') : '<span class="none">none</span>') + '</div></td>' +
+      '<td class="' + (ok ? 'pass">✓' : 'fail">✗') + '</td></tr>';
+  }).join('');
+
+  // Live updates
+  $('form').addEventListener('input', render);
+  $('form').addEventListener('submit', function (e) {
+    e.preventDefault();
+    render();
+    if (window.matchMedia('(max-width: 860px)').matches) $('result').scrollIntoView({ behavior: 'smooth', block: 'start' });
+  });
+  $('decline').addEventListener('click', function () { decide('decline'); });
+  $('verify').addEventListener('click', function () { decide('verify'); });
+  $('continue').addEventListener('click', function () { decide('continue'); });
+
+  // Open on a suspicious example so the first view shows what the tool does.
+  var chips = document.querySelectorAll('.chip');
+  selectSample(E.SAMPLES[1], chips[1]);
+})();
+</script>
+</body>
+</html>

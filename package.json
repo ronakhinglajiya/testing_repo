@@ -1,0 +1,11 @@
+{
+  "name": "ruko-upi-check",
+  "version": "1.0.0",
+  "description": "Stop UPI fraud before payment: a risk-check prototype that flags warning signs in payment requests, QR codes, messages and links.",
+  "private": true,
+  "scripts": {
+    "test": "node --test",
+    "demo": "node demo.js"
+  },
+  "license": "MIT"
+}
